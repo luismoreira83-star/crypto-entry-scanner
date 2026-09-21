@@ -1,0 +1,586 @@
+name: Crypto Entry Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 2 minutos depois de cada fecho de vela de 15 minutos
+    - cron: "2,17,32,47 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Prepare Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+
+      - name: Scan Top 200
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+          import pandas as pd
+          import numpy as np
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+          MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
+
+          TOP_N = 200
+          MIN_VOLUME = 5_000_000
+          BINANCE = "https://data-api.binance.vision"
+          COINGECKO = "https://api.coingecko.com/api/v3"
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "crypto-entry-scanner/1.0"
+          })
+
+          def telegram(text):
+              if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+                  print("Telegram secrets not configured")
+                  return
+              try:
+                  r = requests.post(
+                      f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={
+                          "chat_id": TELEGRAM_CHAT_ID,
+                          "text": text
+                      },
+                      timeout=15
+                  )
+                  print("Telegram:", r.status_code)
+              except Exception as e:
+                  print("Telegram error:", e)
+
+          def ema(series, period):
+              return series.ewm(span=period, adjust=False).mean()
+
+          def rsi(series, period=14):
+              delta = series.diff()
+              gain = delta.clip(lower=0)
+              loss = -delta.clip(upper=0)
+
+              avg_gain = gain.ewm(
+                  alpha=1/period,
+                  adjust=False,
+                  min_periods=period
+              ).mean()
+
+              avg_loss = loss.ewm(
+                  alpha=1/period,
+                  adjust=False,
+                  min_periods=period
+              ).mean()
+
+              rs = avg_gain / avg_loss.replace(0, np.nan)
+
+              return (
+                  100 - 100 / (1 + rs)
+              ).fillna(50)
+
+          def atr(df, period=14):
+              prev = df["close"].shift(1)
+
+              tr = pd.concat([
+                  df["high"] - df["low"],
+                  (df["high"] - prev).abs(),
+                  (df["low"] - prev).abs()
+              ], axis=1).max(axis=1)
+
+              return tr.ewm(
+                  alpha=1/period,
+                  adjust=False
+              ).mean().bfill()
+
+          def get_klines(symbol, interval, limit=180):
+              url = f"{BINANCE}/api/v3/klines"
+
+              r = session.get(
+                  url,
+                  params={
+                      "symbol": symbol,
+                      "interval": interval,
+                      "limit": limit
+                  },
+                  timeout=15
+              )
+
+              r.raise_for_status()
+
+              rows = r.json()
+
+              columns = [
+                  "open_time",
+                  "open",
+                  "high",
+                  "low",
+                  "close",
+                  "volume",
+                  "close_time",
+                  "quote_volume",
+                  "trades",
+                  "buy_base",
+                  "buy_quote",
+                  "ignore"
+              ]
+
+              df = pd.DataFrame(rows, columns=columns)
+
+              for c in [
+                  "open",
+                  "high",
+                  "low",
+                  "close",
+                  "volume",
+                  "quote_volume"
+              ]:
+                  df[c] = pd.to_numeric(
+                      df[c],
+                      errors="coerce"
+                  )
+
+              # A Binance devolve também a vela atualmente aberta.
+              # O scanner usa apenas velas fechadas.
+              if len(df) > 1:
+                  df = df.iloc[:-1].copy()
+
+              df["ema20"] = ema(df["close"], 20)
+              df["ema50"] = ema(df["close"], 50)
+              df["rsi"] = rsi(df["close"])
+              df["atr"] = atr(df)
+
+              df["vol_ma20"] = (
+                  df["volume"]
+                  .rolling(20, min_periods=5)
+                  .mean()
+              )
+
+              df["vol_ratio"] = (
+                  df["volume"] /
+                  df["vol_ma20"].replace(0, np.nan)
+              ).fillna(1)
+
+              return df
+
+          def find_bullish_order_block(df):
+              if len(df) < 40:
+                  return None
+
+              atr_now = df["atr"].iloc[-1]
+
+              # Procura o OB comprador mais recente
+              # nas últimas ~40 horas.
+              for i in range(
+                  len(df) - 5,
+                  max(5, len(df) - 45),
+                  -1
+              ):
+                  candle = df.iloc[i]
+
+                  # Candle bearish
+                  if candle["close"] >= candle["open"]:
+                      continue
+
+                  ob_high = max(
+                      candle["open"],
+                      candle["close"]
+                  )
+
+                  ob_low = candle["low"]
+
+                  future = df.iloc[
+                      i+1:min(i+4, len(df))
+                  ]
+
+                  if len(future) == 0:
+                      continue
+
+                  impulse_high = future["high"].max()
+
+                  # Tem de existir deslocamento real
+                  if impulse_high < (
+                      ob_high + 0.80 * atr_now
+                  ):
+                      continue
+
+                  # Pelo menos uma vela seguinte
+                  # fechou acima do OB
+                  if future["close"].max() <= ob_high:
+                      continue
+
+                  return {
+                      "low": float(ob_low),
+                      "high": float(ob_high),
+                      "index": i
+                  }
+
+              return None
+
+          def analyze(symbol, volume24, rank):
+              try:
+                  h1 = get_klines(symbol, "1h")
+                  m15 = get_klines(symbol, "15m")
+
+                  if len(h1) < 60 or len(m15) < 60:
+                      return None
+
+                  H = h1.iloc[-1]
+                  M = m15.iloc[-1]
+
+                  price = float(M["close"])
+
+                  # Tendência principal 1H
+                  trend_1h = (
+                      H["close"] > H["ema20"] >
+                      H["ema50"]
+                  )
+
+                  ema20_rising = (
+                      h1["ema20"].iloc[-1] >
+                      h1["ema20"].iloc[-4]
+                  )
+
+                  ob = find_bullish_order_block(h1)
+
+                  if not ob:
+                      return {
+                          "symbol": symbol,
+                          "status": "AGUARDAR",
+                          "score": 0,
+                          "rank": rank
+                      }
+
+                  ob_low = ob["low"]
+                  ob_high = ob["high"]
+
+                  recent15 = m15.iloc[-6:]
+
+                  # Preço regressou ao OB
+                  touched = (
+                      recent15["low"].min()
+                      <= ob_high * 1.003
+                  )
+
+                  # Evita OB completamente perdido
+                  ob_valid = (
+                      recent15["close"].min()
+                      > ob_low * 0.985
+                  )
+
+                  # Confirmação/reclaim
+                  reclaim = (
+                      M["close"] > ob_high and
+                      M["close"] > M["open"]
+                  )
+
+                  volume_ok = (
+                      M["vol_ratio"] >= 1.15
+                  )
+
+                  rsi_ok = (
+                      45 <= M["rsi"] <= 70
+                  )
+
+                  # Evita perseguir preço demasiado afastado
+                  not_extended = (
+                      price <=
+                      H["ema20"] + 1.60 * H["atr"]
+                  )
+
+                  # Estrutura recente 15m
+                  structure15 = (
+                      m15["close"].iloc[-1] >
+                      m15["close"].iloc[-4]
+                  )
+
+                  score = 0
+
+                  if trend_1h:
+                      score += 20
+
+                  if ema20_rising:
+                      score += 10
+
+                  if ob_valid:
+                      score += 15
+
+                  if touched:
+                      score += 15
+
+                  if reclaim:
+                      score += 15
+
+                  if volume_ok:
+                      score += 10
+
+                  if rsi_ok:
+                      score += 5
+
+                  if structure15:
+                      score += 5
+
+                  if not_extended:
+                      score += 5
+
+                  enter = all([
+                      trend_1h,
+                      ema20_rising,
+                      ob_valid,
+                      touched,
+                      reclaim,
+                      volume_ok,
+                      rsi_ok,
+                      structure15,
+                      not_extended
+                  ])
+
+                  status = (
+                      "ENTRAR"
+                      if enter
+                      else "AGUARDAR"
+                  )
+
+                  atr15 = float(M["atr"])
+
+                  entry_low = max(
+                      ob_high,
+                      price - 0.25 * atr15
+                  )
+
+                  entry_high = (
+                      price + 0.10 * atr15
+                  )
+
+                  stop = min(
+                      ob_low - 0.10 * atr15,
+                      entry_low - 1.15 * atr15
+                  )
+
+                  risk = max(
+                      entry_low - stop,
+                      atr15 * 0.5
+                  )
+
+                  tp1 = entry_low + 1.5 * risk
+                  tp2 = entry_low + 2.2 * risk
+                  tp3 = entry_low + 3.0 * risk
+
+                  return {
+                      "symbol": symbol,
+                      "rank": rank,
+                      "status": status,
+                      "score": score,
+                      "price": price,
+                      "entry_low": entry_low,
+                      "entry_high": entry_high,
+                      "stop": stop,
+                      "tp1": tp1,
+                      "tp2": tp2,
+                      "tp3": tp3,
+                      "rsi": float(M["rsi"]),
+                      "volume_ratio": float(
+                          M["vol_ratio"]
+                      ),
+                      "volume24": volume24,
+                      "ob_low": ob_low,
+                      "ob_high": ob_high
+                  }
+
+              except Exception as e:
+                  print(symbol, "ERROR:", e)
+                  return None
+
+          print("Obtendo Top 200 por market cap...")
+
+          cg = session.get(
+              f"{COINGECKO}/coins/markets",
+              params={
+                  "vs_currency": "usd",
+                  "order": "market_cap_desc",
+                  "per_page": TOP_N,
+                  "page": 1,
+                  "sparkline": "false"
+              },
+              timeout=25
+          )
+
+          cg.raise_for_status()
+
+          coins = cg.json()
+
+          print("Obtendo pares Binance...")
+
+          exchange = session.get(
+              f"{BINANCE}/api/v3/exchangeInfo",
+              timeout=25
+          )
+
+          exchange.raise_for_status()
+
+          valid_pairs = {
+              s["symbol"]
+              for s in exchange.json()["symbols"]
+              if s["status"] == "TRADING"
+              and s["quoteAsset"] == "USDT"
+              and s.get(
+                  "isSpotTradingAllowed",
+                  True
+              )
+          }
+
+          tickers_req = session.get(
+              f"{BINANCE}/api/v3/ticker/24hr",
+              timeout=25
+          )
+
+          tickers_req.raise_for_status()
+
+          volume_map = {
+              x["symbol"]:
+              float(x.get("quoteVolume", 0) or 0)
+              for x in tickers_req.json()
+          }
+
+          candidates = []
+
+          for coin in coins:
+              base = coin["symbol"].upper()
+              pair = base + "USDT"
+
+              if pair not in valid_pairs:
+                  continue
+
+              vol = volume_map.get(pair, 0)
+
+              if vol < MIN_VOLUME:
+                  continue
+
+              candidates.append({
+                  "symbol": pair,
+                  "rank": coin.get(
+                      "market_cap_rank",
+                      999
+                  ),
+                  "volume": vol
+              })
+
+          print(
+              f"{len(candidates)} pares "
+              "Top-200 elegíveis."
+          )
+
+          results = []
+
+          # Limita concorrência para respeitar a API.
+          with ThreadPoolExecutor(
+              max_workers=8
+          ) as executor:
+
+              futures = {
+                  executor.submit(
+                      analyze,
+                      x["symbol"],
+                      x["volume"],
+                      x["rank"]
+                  ): x
+                  for x in candidates
+              }
+
+              for future in as_completed(futures):
+                  result = future.result()
+
+                  if result:
+                      results.append(result)
+
+          results.sort(
+              key=lambda x: (
+                  x.get("status") == "ENTRAR",
+                  x.get("score", 0)
+              ),
+              reverse=True
+          )
+
+          enter_signals = [
+              r for r in results
+              if r.get("status") == "ENTRAR"
+          ]
+
+          print(
+              "Sinais ENTRAR:",
+              len(enter_signals)
+          )
+
+          for r in enter_signals:
+              msg = (
+                  f"🟢 ENTRAR — {r['symbol']}\n\n"
+                  f"Market Cap Rank: #{r['rank']}\n"
+                  f"Score técnico: {r['score']}/100\n"
+                  f"Preço: {r['price']:.8g}\n\n"
+                  f"Entrada: "
+                  f"{r['entry_low']:.8g} – "
+                  f"{r['entry_high']:.8g}\n"
+                  f"Stop técnico: {r['stop']:.8g}\n"
+                  f"TP1: {r['tp1']:.8g}\n"
+                  f"TP2: {r['tp2']:.8g}\n"
+                  f"TP3: {r['tp3']:.8g}\n\n"
+                  f"RSI 15m: {r['rsi']:.1f}\n"
+                  f"Volume 15m: "
+                  f"{r['volume_ratio']:.2f}x média\n"
+                  f"OB comprador: "
+                  f"{r['ob_low']:.8g} – "
+                  f"{r['ob_high']:.8g}\n\n"
+                  "✅ Tendência 1H\n"
+                  "✅ Order Block comprador\n"
+                  "✅ Reteste 15m\n"
+                  "✅ Reclaim\n"
+                  "✅ Confirmação de volume\n\n"
+                  "⚠️ Sinal técnico; "
+                  "não garante lucro."
+              )
+
+              telegram(msg)
+
+              time.sleep(1)
+
+          # Quando executamos manualmente,
+          # envia confirmação mesmo sem entrada.
+          if MANUAL_RUN:
+              top = results[:5]
+
+              lines = [
+                  "🧪 SCANNER EXECUTADO",
+                  "",
+                  f"Top 200 analisado.",
+                  f"Pares elegíveis: "
+                  f"{len(candidates)}",
+                  f"Sinais ENTRAR: "
+                  f"{len(enter_signals)}",
+                  "",
+                  "Melhores scores:"
+              ]
+
+              for x in top:
+                  lines.append(
+                      f"{x['symbol']} — "
+                      f"{x.get('score',0)}/100 "
+                      f"({x.get('status','')})"
+                  )
+
+              telegram("\n".join(lines))
+
+          print("SCAN TERMINADO")
+
+          PY
