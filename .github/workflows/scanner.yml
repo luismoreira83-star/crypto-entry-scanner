@@ -459,29 +459,29 @@ jobs:
               confirmation_text = (
                   "vela 15m mais recente"
                   if age == 0
-                  else f"ha {age} vela(s) 15m (~{age*15} min), ainda valida"
+                  else f"h\u00e1 {age} vela(s) 15m (~{age*15} min), ainda v\u00e1lida"
               )
 
               msg = (
-                  f"[ENTRAR] ENTRAR - {symbol}\n\n"
+                  f"\U0001F7E2 ENTRAR - {symbol}\n\n"
                   f"Market Cap Rank: #{r['rank']}\n"
-                  f"Score tecnico: {r['score']}/100\n"
-                  f"Preco: {r['price']:.8g}\n\n"
+                  f"Score t\u00e9cnico: {r['score']}/100\n"
+                  f"Pre\u00e7o: {r['price']:.8g}\n\n"
                   f"Entrada: {r['entry_low']:.8g} - {r['entry_high']:.8g}\n"
-                  f"Stop tecnico: {r['stop']:.8g}\n"
+                  f"Stop t\u00e9cnico: {r['stop']:.8g}\n"
                   f"TP1: {r['tp1']:.8g}\n"
                   f"TP2: {r['tp2']:.8g}\n"
                   f"TP3: {r['tp3']:.8g}\n\n"
-                  f"RSI confirmacao: {r['rsi']:.1f}\n"
-                  f"Volume confirmacao: {r['volume_ratio']:.2f}x media\n"
+                  f"RSI confirma\u00e7\u00e3o: {r['rsi']:.1f}\n"
+                  f"Volume confirma\u00e7\u00e3o: {r['volume_ratio']:.2f}x media\n"
                   f"OB comprador: {r['ob_low']:.8g} - {r['ob_high']:.8g}\n"
-                  f"Confirmacao: {confirmation_text}\n\n"
-                  "[OK] Tendencia 1H\n"
-                  "[OK] Order Block comprador\n"
-                  "[OK] Reteste + reclaim 15m\n"
-                  "[OK] Confirmacao de volume\n"
-                  "[OK] Sem extensao excessiva\n\n"
-                  "[AVISO] Sinal tecnico; nao garante lucro."
+                  f"Confirma\u00e7\u00e3o: {confirmation_text}\n\n"
+                  "\u2705 Tendencia 1H\n"
+                  "\u2705 Order Block comprador\n"
+                  "\u2705 Reteste + reclaim 15m\n"
+                  "\u2705 Confirmacao de volume\n"
+                  "\u2705 Sem extensao excessiva\n\n"
+                  "\u26A0\uFE0F Sinal tecnico; nao garante lucro."
               )
 
               if telegram(msg):
@@ -510,14 +510,14 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  "[TESTE] SCANNER EXECUTADO - v2.2 FINAL ASCII",
+                  "\U0001F9EA SCANNER EXECUTADO - v2.2 FINAL",
                   "",
                   "Top 200 analisado.",
-                  f"Pares elegiveis: {len(candidates)}",
+                  f"Pares eleg\u00edveis: {len(candidates)}",
                   f"Sinais ENTRAR: {len(enter_signals)}",
                   f"Novos alertas: {alerts_sent}",
                   f"Duplicados bloqueados: {duplicates}",
-                  f"Bloqueados pos-stop: {stop_blocks}",
+                  f"Bloqueados p\u00f3s-stop: {stop_blocks}",
                   "",
                   "Melhores scores:"
               ]
@@ -532,7 +532,7 @@ jobs:
 
               lines += [
                   "",
-                  "[PAPER] PAPER TRADING",
+                  "\U0001F4CA PAPER TRADING",
                   f"Abertos: {len(opened)}",
                   f"Fechados: {len(closed)}"
               ]
