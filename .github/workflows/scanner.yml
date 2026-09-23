@@ -136,7 +136,7 @@ jobs:
               for c in ["open","high","low","close","volume","quote_volume","open_time","close_time"]:
                   df[c] = pd.to_numeric(df[c], errors="coerce")
 
-              # S贸 velas fechadas.
+              # So velas fechadas.
               if len(df) > 1:
                   df = df.iloc[:-1].copy()
 
@@ -220,7 +220,7 @@ jobs:
               if len(recent_48h) >= 2 and age < DOUBLE_STOP_COOLDOWN:
                   return True, "2 stops recentes / bloqueio 24h"
               if age < POST_STOP_COOLDOWN:
-                  return True, "cooldown 12h ap贸s stop"
+                  return True, "cooldown 12h apos stop"
               return False, ""
 
           def bullish_ob(df):
@@ -407,7 +407,7 @@ jobs:
                   "volume":vol
               })
 
-          print(f"{len(candidates)} pares Top-200 eleg铆veis.")
+          print(f"{len(candidates)} pares Top-200 elegiveis.")
 
           results = []
           with ThreadPoolExecutor(max_workers=8) as pool:
@@ -459,29 +459,29 @@ jobs:
               confirmation_text = (
                   "vela 15m mais recente"
                   if age == 0
-                  else f"h谩 {age} vela(s) 15m (~{age*15} min), ainda v谩lida"
+                  else f"ha {age} vela(s) 15m (~{age*15} min), ainda valida"
               )
 
               msg = (
-                  f"馃煝 ENTRAR 鈥� {symbol}\n\n"
+                  f"[ENTRAR] ENTRAR - {symbol}\n\n"
                   f"Market Cap Rank: #{r['rank']}\n"
-                  f"Score t茅cnico: {r['score']}/100\n"
-                  f"Pre莽o: {r['price']:.8g}\n\n"
-                  f"Entrada: {r['entry_low']:.8g} 鈥� {r['entry_high']:.8g}\n"
-                  f"Stop t茅cnico: {r['stop']:.8g}\n"
+                  f"Score tecnico: {r['score']}/100\n"
+                  f"Preco: {r['price']:.8g}\n\n"
+                  f"Entrada: {r['entry_low']:.8g} - {r['entry_high']:.8g}\n"
+                  f"Stop tecnico: {r['stop']:.8g}\n"
                   f"TP1: {r['tp1']:.8g}\n"
                   f"TP2: {r['tp2']:.8g}\n"
                   f"TP3: {r['tp3']:.8g}\n\n"
-                  f"RSI confirma莽茫o: {r['rsi']:.1f}\n"
-                  f"Volume confirma莽茫o: {r['volume_ratio']:.2f}x m茅dia\n"
-                  f"OB comprador: {r['ob_low']:.8g} 鈥� {r['ob_high']:.8g}\n"
-                  f"Confirma莽茫o: {confirmation_text}\n\n"
-                  "鉁� Tend锚ncia 1H\n"
-                  "鉁� Order Block comprador\n"
-                  "鉁� Reteste + reclaim 15m\n"
-                  "鉁� Confirma莽茫o de volume\n"
-                  "鉁� Sem extens茫o excessiva\n\n"
-                  "鈿狅笍 Sinal t茅cnico; n茫o garante lucro."
+                  f"RSI confirmacao: {r['rsi']:.1f}\n"
+                  f"Volume confirmacao: {r['volume_ratio']:.2f}x media\n"
+                  f"OB comprador: {r['ob_low']:.8g} - {r['ob_high']:.8g}\n"
+                  f"Confirmacao: {confirmation_text}\n\n"
+                  "[OK] Tendencia 1H\n"
+                  "[OK] Order Block comprador\n"
+                  "[OK] Reteste + reclaim 15m\n"
+                  "[OK] Confirmacao de volume\n"
+                  "[OK] Sem extensao excessiva\n\n"
+                  "[AVISO] Sinal tecnico; nao garante lucro."
               )
 
               if telegram(msg):
@@ -510,14 +510,14 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  "馃И SCANNER EXECUTADO 鈥� v2.2 FINAL",
+                  "[TESTE] SCANNER EXECUTADO - v2.2 FINAL ASCII",
                   "",
                   "Top 200 analisado.",
-                  f"Pares eleg铆veis: {len(candidates)}",
+                  f"Pares elegiveis: {len(candidates)}",
                   f"Sinais ENTRAR: {len(enter_signals)}",
                   f"Novos alertas: {alerts_sent}",
                   f"Duplicados bloqueados: {duplicates}",
-                  f"Bloqueados p贸s-stop: {stop_blocks}",
+                  f"Bloqueados pos-stop: {stop_blocks}",
                   "",
                   "Melhores scores:"
               ]
@@ -526,13 +526,13 @@ jobs:
                   age = x.get("signal_age_candles", 999)
                   age_txt = "agora" if age == 0 else (f"{age}x15m" if age != 999 else "-")
                   lines.append(
-                      f"{x['symbol']} 鈥� {x.get('score',0)}/100 "
+                      f"{x['symbol']} - {x.get('score',0)}/100 "
                       f"({x.get('status','')}) [{age_txt}]"
                   )
 
               lines += [
                   "",
-                  "馃搳 PAPER TRADING",
+                  "[PAPER] PAPER TRADING",
                   f"Abertos: {len(opened)}",
                   f"Fechados: {len(closed)}"
               ]
@@ -550,7 +550,7 @@ jobs:
                       (
                           f"Profit factor: {pf:.2f}"
                           if np.isfinite(pf)
-                          else "Profit factor: 鈭�"
+                          else "Profit factor: INF"
                       )
                   ]
 
@@ -559,8 +559,8 @@ jobs:
           save_state()
 
           print("STATE:", len(STATE["trades"]), "paper trades")
-          print("Paper fechados nesta execu莽茫o:", len(closed_now))
-          print("Bloqueios p贸s-stop:", stop_blocks)
+          print("Paper fechados nesta execucao:", len(closed_now))
+          print("Bloqueios pos-stop:", stop_blocks)
           print("SCAN TERMINADO")
 
           PY
