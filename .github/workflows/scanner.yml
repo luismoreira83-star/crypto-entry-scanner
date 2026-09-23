@@ -3,7 +3,8 @@ name: Crypto Entry Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "2,17,32,47 * * * *"
+    # 7 min depois do fecho de cada vela 15m.
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
   contents: read
@@ -52,10 +53,17 @@ jobs:
           BINANCE = "https://data-api.binance.vision"
           COINGECKO = "https://api.coingecko.com/api/v3"
           STATE_FILE = "scanner_state.json"
-          COOLDOWN = 3 * 60 * 60
+
+          ALERT_COOLDOWN = 3 * 60 * 60
+          POST_STOP_COOLDOWN = 12 * 60 * 60
+          DOUBLE_STOP_WINDOW = 48 * 60 * 60
+          DOUBLE_STOP_COOLDOWN = 24 * 60 * 60
+
+          RECOVERY_CANDLES_15M = 4
+          MAX_LATE_EXTENSION_ATR = 0.60
 
           s = requests.Session()
-          s.headers.update({"User-Agent": "crypto-entry-scanner/2.1"})
+          s.headers.update({"User-Agent": "crypto-entry-scanner/2.2"})
 
           def load_state():
               try:
@@ -65,7 +73,6 @@ jobs:
                       raise ValueError
               except Exception:
                   x = {}
-
               x.setdefault("alerts", {})
               x.setdefault("trades", [])
               return x
@@ -74,924 +81,486 @@ jobs:
 
           def save_state():
               with open(STATE_FILE, "w", encoding="utf-8") as f:
-                  json.dump(
-                      STATE,
-                      f,
-                      ensure_ascii=False,
-                      indent=2
-                  )
+                  json.dump(STATE, f, ensure_ascii=False, indent=2)
 
           def telegram(text):
               if not TOKEN or not CHAT_ID:
                   print("Telegram secrets not configured")
                   return False
-
               try:
                   r = requests.post(
                       f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      json={
-                          "chat_id": CHAT_ID,
-                          "text": text
-                      },
+                      json={"chat_id": CHAT_ID, "text": text},
                       timeout=15
                   )
-
                   print("Telegram:", r.status_code)
-
                   return r.status_code == 200
-
               except Exception as e:
                   print("Telegram error:", e)
                   return False
 
           def ema(x, n):
-              return x.ewm(
-                  span=n,
-                  adjust=False
-              ).mean()
+              return x.ewm(span=n, adjust=False).mean()
 
           def rsi(x, n=14):
               d = x.diff()
               g = d.clip(lower=0)
               l = -d.clip(upper=0)
-
-              ag = g.ewm(
-                  alpha=1/n,
-                  adjust=False,
-                  min_periods=n
-              ).mean()
-
-              al = l.ewm(
-                  alpha=1/n,
-                  adjust=False,
-                  min_periods=n
-              ).mean()
-
+              ag = g.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+              al = l.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
               rs = ag / al.replace(0, np.nan)
-
-              return (
-                  100 - 100/(1 + rs)
-              ).fillna(50)
+              return (100 - 100/(1 + rs)).fillna(50)
 
           def atr(df, n=14):
-              p = df["close"].shift(1)
-
+              prev = df["close"].shift(1)
               tr = pd.concat([
                   df["high"] - df["low"],
-                  (df["high"] - p).abs(),
-                  (df["low"] - p).abs()
+                  (df["high"] - prev).abs(),
+                  (df["low"] - prev).abs()
               ], axis=1).max(axis=1)
-
-              return tr.ewm(
-                  alpha=1/n,
-                  adjust=False
-              ).mean().bfill()
+              return tr.ewm(alpha=1/n, adjust=False).mean().bfill()
 
           def klines(symbol, interval, limit=180):
               r = s.get(
                   f"{BINANCE}/api/v3/klines",
-                  params={
-                      "symbol": symbol,
-                      "interval": interval,
-                      "limit": limit
-                  },
+                  params={"symbol": symbol, "interval": interval, "limit": limit},
                   timeout=15
               )
-
               r.raise_for_status()
-
               cols = [
-                  "open_time",
-                  "open",
-                  "high",
-                  "low",
-                  "close",
-                  "volume",
-                  "close_time",
-                  "quote_volume",
-                  "trades",
-                  "buy_base",
-                  "buy_quote",
-                  "ignore"
+                  "open_time","open","high","low","close","volume",
+                  "close_time","quote_volume","trades","buy_base",
+                  "buy_quote","ignore"
               ]
+              df = pd.DataFrame(r.json(), columns=cols)
+              for c in ["open","high","low","close","volume","quote_volume","open_time","close_time"]:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
 
-              df = pd.DataFrame(
-                  r.json(),
-                  columns=cols
-              )
-
-              for c in [
-                  "open",
-                  "high",
-                  "low",
-                  "close",
-                  "volume",
-                  "quote_volume",
-                  "open_time",
-                  "close_time"
-              ]:
-                  df[c] = pd.to_numeric(
-                      df[c],
-                      errors="coerce"
-                  )
-
-              # Ignora a vela ainda aberta.
+              # S贸 velas fechadas.
               if len(df) > 1:
                   df = df.iloc[:-1].copy()
 
-              df["ema20"] = ema(
-                  df["close"],
-                  20
-              )
-
-              df["ema50"] = ema(
-                  df["close"],
-                  50
-              )
-
-              df["rsi"] = rsi(
-                  df["close"]
-              )
-
+              df["ema20"] = ema(df["close"], 20)
+              df["ema50"] = ema(df["close"], 50)
+              df["rsi"] = rsi(df["close"])
               df["atr"] = atr(df)
-
-              df["vol_ma20"] = (
-                  df["volume"]
-                  .rolling(
-                      20,
-                      min_periods=5
-                  )
-                  .mean()
-              )
-
+              df["vol_ma20"] = df["volume"].rolling(20, min_periods=5).mean()
               df["vol_ratio"] = (
-                  df["volume"] /
-                  df["vol_ma20"]
-                  .replace(0, np.nan)
+                  df["volume"] / df["vol_ma20"].replace(0, np.nan)
               ).fillna(1)
-
               return df
 
           def update_paper():
               closed_now = []
-
               for t in STATE["trades"]:
-
                   if t.get("status") != "OPEN":
                       continue
-
                   try:
-                      df = klines(
-                          t["symbol"],
-                          "15m",
-                          100
-                      )
-
-                      last_checked = int(
-                          t.get(
-                              "last_checked",
-                              t.get(
-                                  "opened_at",
-                                  0
-                              )
-                          )
-                      )
+                      df = klines(t["symbol"], "15m", 100)
+                      last_checked = int(t.get("last_checked", t.get("opened_at", 0)))
 
                       for _, c in df.iterrows():
-
-                          close_time = int(
-                              c["close_time"] /
-                              1000
-                          )
-
+                          close_time = int(c["close_time"] / 1000)
                           if close_time <= last_checked:
                               continue
 
                           t["last_checked"] = close_time
+                          low = float(c["low"])
+                          high = float(c["high"])
+                          stop = float(t["stop"])
+                          tp1 = float(t["tp1"])
+                          entry = float(t["entry"])
 
-                          low = float(
-                              c["low"]
-                          )
-
-                          high = float(
-                              c["high"]
-                          )
-
-                          stop = float(
-                              t["stop"]
-                          )
-
-                          tp1 = float(
-                              t["tp1"]
-                          )
-
-                          entry = float(
-                              t["entry"]
-                          )
-
-                          # Regra conservadora:
-                          # se stop e TP1 forem tocados
-                          # na mesma vela, conta STOP.
+                          # Conservador: se TP1 e stop forem tocados na mesma vela, conta stop.
                           if low <= stop:
-
                               t.update({
-                                  "status": "CLOSED",
-                                  "outcome": "STOP",
-                                  "exit": stop,
-                                  "pnl_r": -1.0,
-                                  "closed_at": close_time
+                                  "status":"CLOSED","outcome":"STOP","exit":stop,
+                                  "pnl_r":-1.0,"closed_at":close_time
                               })
-
-                              closed_now.append(
-                                  t.copy()
-                              )
-
-                              print(
-                                  "PAPER CLOSED:",
-                                  t["symbol"],
-                                  "STOP",
-                                  "-1.00R"
-                              )
-
+                              closed_now.append(t.copy())
+                              print("PAPER CLOSED:", t["symbol"], "STOP", "-1.00R")
                               break
 
                           if high >= tp1:
-
-                              risk = max(
-                                  entry - stop,
-                                  1e-12
-                              )
-
-                              pnl_r = (
-                                  tp1 - entry
-                              ) / risk
-
+                              risk = max(entry - stop, 1e-12)
+                              pnl_r = (tp1 - entry) / risk
                               t.update({
-                                  "status": "CLOSED",
-                                  "outcome": "TP1",
-                                  "exit": tp1,
-                                  "pnl_r": pnl_r,
-                                  "closed_at": close_time
+                                  "status":"CLOSED","outcome":"TP1","exit":tp1,
+                                  "pnl_r":pnl_r,"closed_at":close_time
                               })
-
-                              closed_now.append(
-                                  t.copy()
-                              )
-
-                              print(
-                                  "PAPER CLOSED:",
-                                  t["symbol"],
-                                  "TP1",
-                                  f"{pnl_r:.2f}R"
-                              )
-
+                              closed_now.append(t.copy())
+                              print("PAPER CLOSED:", t["symbol"], "TP1", f"{pnl_r:.2f}R")
                               break
 
                   except Exception as e:
-                      print(
-                          "Paper update error",
-                          t.get("symbol"),
-                          e
-                      )
-
+                      print("Paper update error", t.get("symbol"), e)
               return closed_now
 
-          def bullish_ob(df):
+          def stop_block(symbol, now_ts):
+              stops = [
+                  t for t in STATE["trades"]
+                  if (
+                      t.get("symbol") == symbol
+                      and t.get("status") == "CLOSED"
+                      and t.get("outcome") == "STOP"
+                      and t.get("closed_at")
+                  )
+              ]
+              if not stops:
+                  return False, ""
 
+              stops.sort(key=lambda t: int(t.get("closed_at", 0)), reverse=True)
+              last_stop = int(stops[0].get("closed_at", 0))
+              age = now_ts - last_stop
+              recent_48h = [
+                  t for t in stops
+                  if now_ts - int(t.get("closed_at", 0)) <= DOUBLE_STOP_WINDOW
+              ]
+
+              if len(recent_48h) >= 2 and age < DOUBLE_STOP_COOLDOWN:
+                  return True, "2 stops recentes / bloqueio 24h"
+              if age < POST_STOP_COOLDOWN:
+                  return True, "cooldown 12h ap贸s stop"
+              return False, ""
+
+          def bullish_ob(df):
               if len(df) < 40:
                   return None
+              a = float(df["atr"].iloc[-1])
 
-              a = float(
-                  df["atr"].iloc[-1]
-              )
-
-              for i in range(
-                  len(df)-5,
-                  max(
-                      5,
-                      len(df)-45
-                  ),
-                  -1
-              ):
-
+              for i in range(len(df)-5, max(5, len(df)-45), -1):
                   c = df.iloc[i]
-
-                  # Candle bearish antes
-                  # de deslocamento bullish.
                   if c["close"] >= c["open"]:
                       continue
 
-                  high = max(
-                      c["open"],
-                      c["close"]
-                  )
-
+                  high = max(c["open"], c["close"])
                   low = c["low"]
-
-                  future = df.iloc[
-                      i+1:
-                      min(
-                          i+4,
-                          len(df)
-                      )
-                  ]
+                  future = df.iloc[i+1:min(i+4, len(df))]
 
                   if len(future) == 0:
                       continue
-
-                  if future["high"].max() < (
-                      high + 0.80*a
-                  ):
+                  if future["high"].max() < high + 0.80*a:
                       continue
-
                   if future["close"].max() <= high:
                       continue
 
-                  return {
-                      "low": float(low),
-                      "high": float(high)
-                  }
-
+                  return {"low": float(low), "high": float(high)}
               return None
 
-          def analyze(
-              symbol,
-              volume24,
-              rank
-          ):
+          def recent_confirmation(m15, ob_low, ob_high):
+              last_idx = len(m15) - 1
+              start_idx = max(3, last_idx - RECOVERY_CANDLES_15M + 1)
 
+              for idx in range(last_idx, start_idx - 1, -1):
+                  C = m15.iloc[idx]
+                  recent = m15.iloc[max(0, idx-5):idx+1]
+
+                  touched = recent["low"].min() <= ob_high * 1.003
+                  ob_valid = recent["close"].min() > ob_low * 0.985
+                  reclaim = C["close"] > ob_high and C["close"] > C["open"]
+                  volume_ok = C["vol_ratio"] >= 1.15
+                  rsi_ok = 45 <= C["rsi"] <= 70
+                  structure = C["close"] > m15.iloc[idx-3]["close"]
+
+                  if all([touched, ob_valid, reclaim, volume_ok, rsi_ok, structure]):
+                      return {
+                          "age_candles": last_idx - idx,
+                          "close": float(C["close"]),
+                          "rsi": float(C["rsi"]),
+                          "volume_ratio": float(C["vol_ratio"])
+                      }
+              return None
+
+          def analyze(symbol, volume24, rank):
               try:
-                  h1 = klines(
-                      symbol,
-                      "1h"
-                  )
-
-                  m15 = klines(
-                      symbol,
-                      "15m"
-                  )
-
-                  if (
-                      len(h1) < 60
-                      or len(m15) < 60
-                  ):
+                  h1 = klines(symbol, "1h")
+                  m15 = klines(symbol, "15m")
+                  if len(h1) < 60 or len(m15) < 60:
                       return None
 
                   H = h1.iloc[-1]
                   M = m15.iloc[-1]
+                  price = float(M["close"])
 
-                  price = float(
-                      M["close"]
-                  )
-
-                  trend = (
-                      H["close"] >
-                      H["ema20"] >
-                      H["ema50"]
-                  )
-
-                  ema_rising = (
-                      h1["ema20"].iloc[-1] >
-                      h1["ema20"].iloc[-4]
-                  )
+                  trend = H["close"] > H["ema20"] > H["ema50"]
+                  ema_rising = h1["ema20"].iloc[-1] > h1["ema20"].iloc[-4]
 
                   ob = bullish_ob(h1)
-
                   if not ob:
-                      return {
-                          "symbol": symbol,
-                          "status": "AGUARDAR",
-                          "score": 0,
-                          "rank": rank
-                      }
+                      return {"symbol":symbol, "status":"AGUARDAR", "score":0, "rank":rank}
 
                   ob_low = ob["low"]
                   ob_high = ob["high"]
+                  current_recent = m15.iloc[-6:]
+                  ob_valid_now = current_recent["close"].min() > ob_low * 0.985
 
-                  recent = m15.iloc[-6:]
-
-                  touched = (
-                      recent["low"].min()
-                      <= ob_high * 1.003
-                  )
-
-                  ob_valid = (
-                      recent["close"].min()
-                      > ob_low * 0.985
-                  )
-
-                  reclaim = (
-                      M["close"] > ob_high
-                      and M["close"] > M["open"]
-                  )
-
-                  volume_ok = (
-                      M["vol_ratio"] >= 1.15
-                  )
-
-                  rsi_ok = (
-                      45 <= M["rsi"] <= 70
-                  )
-
-                  not_extended = (
-                      price <=
-                      H["ema20"] +
-                      1.60 * H["atr"]
-                  )
-
-                  structure = (
-                      m15["close"].iloc[-1] >
-                      m15["close"].iloc[-4]
+                  confirm = recent_confirmation(m15, ob_low, ob_high)
+                  a15 = float(M["atr"])
+                  not_extended = price <= H["ema20"] + 1.60 * H["atr"]
+                  current_above_ob = price > ob_high
+                  late_not_chased = bool(
+                      confirm and price <= confirm["close"] + MAX_LATE_EXTENSION_ATR * a15
                   )
 
                   score = (
                       20*trend +
                       10*ema_rising +
-                      15*ob_valid +
-                      15*touched +
-                      15*reclaim +
-                      10*volume_ok +
-                      5*rsi_ok +
-                      5*structure +
+                      15*ob_valid_now +
+                      50*bool(confirm) +
                       5*not_extended
                   )
 
                   enter = all([
                       trend,
                       ema_rising,
-                      ob_valid,
-                      touched,
-                      reclaim,
-                      volume_ok,
-                      rsi_ok,
-                      structure,
+                      ob_valid_now,
+                      bool(confirm),
+                      current_above_ob,
+                      late_not_chased,
                       not_extended
                   ])
 
-                  a15 = float(
-                      M["atr"]
-                  )
-
-                  entry_low = max(
-                      ob_high,
-                      price - 0.25*a15
-                  )
-
-                  entry_high = (
-                      price + 0.10*a15
-                  )
-
-                  stop = min(
-                      ob_low - 0.10*a15,
-                      entry_low - 1.15*a15
-                  )
-
-                  risk = max(
-                      entry_low - stop,
-                      0.5*a15
-                  )
+                  entry_low = max(ob_high, price - 0.25*a15)
+                  entry_high = price + 0.10*a15
+                  stop = min(ob_low - 0.10*a15, entry_low - 1.15*a15)
+                  risk = max(entry_low - stop, 0.5*a15)
 
                   return {
-                      "symbol": symbol,
-                      "rank": rank,
-                      "status":
-                          "ENTRAR"
-                          if enter
-                          else "AGUARDAR",
-                      "score": int(score),
-                      "price": price,
-                      "entry_low": entry_low,
-                      "entry_high": entry_high,
-                      "stop": stop,
-                      "tp1":
-                          entry_low +
-                          1.5*risk,
-                      "tp2":
-                          entry_low +
-                          2.2*risk,
-                      "tp3":
-                          entry_low +
-                          3.0*risk,
-                      "rsi":
-                          float(
-                              M["rsi"]
-                          ),
-                      "volume_ratio":
-                          float(
-                              M["vol_ratio"]
-                          ),
-                      "volume24":
-                          volume24,
-                      "ob_low":
-                          ob_low,
-                      "ob_high":
-                          ob_high
+                      "symbol":symbol,
+                      "rank":rank,
+                      "status":"ENTRAR" if enter else "AGUARDAR",
+                      "score":int(score),
+                      "price":price,
+                      "entry_low":entry_low,
+                      "entry_high":entry_high,
+                      "stop":stop,
+                      "tp1":entry_low + 1.5*risk,
+                      "tp2":entry_low + 2.2*risk,
+                      "tp3":entry_low + 3.0*risk,
+                      "rsi":float(confirm["rsi"]) if confirm else float(M["rsi"]),
+                      "volume_ratio":(
+                          float(confirm["volume_ratio"])
+                          if confirm else float(M["vol_ratio"])
+                      ),
+                      "volume24":volume24,
+                      "ob_low":ob_low,
+                      "ob_high":ob_high,
+                      "signal_age_candles":(
+                          int(confirm["age_candles"]) if confirm else 999
+                      )
                   }
 
               except Exception as e:
-                  print(
-                      symbol,
-                      "ERROR:",
-                      e
-                  )
-
+                  print(symbol, "ERROR:", e)
                   return None
 
-          print(
-              "Obtendo Top 200 "
-              "por market cap..."
-          )
+          print("Obtendo Top 200 por market cap...")
 
           cg = s.get(
               f"{COINGECKO}/coins/markets",
               params={
-                  "vs_currency": "usd",
-                  "order": "market_cap_desc",
-                  "per_page": TOP_N,
-                  "page": 1,
-                  "sparkline": "false"
+                  "vs_currency":"usd",
+                  "order":"market_cap_desc",
+                  "per_page":TOP_N,
+                  "page":1,
+                  "sparkline":"false"
               },
               timeout=25
           )
-
           cg.raise_for_status()
-
           coins = cg.json()
 
-          print(
-              "Obtendo pares Binance..."
-          )
+          print("Obtendo pares Binance...")
 
-          ex = s.get(
-              f"{BINANCE}/api/v3/exchangeInfo",
-              timeout=25
-          )
-
+          ex = s.get(f"{BINANCE}/api/v3/exchangeInfo", timeout=25)
           ex.raise_for_status()
-
           valid = {
               x["symbol"]
               for x in ex.json()["symbols"]
-              if x["status"] == "TRADING"
-              and x["quoteAsset"] == "USDT"
-              and x.get(
-                  "isSpotTradingAllowed",
-                  True
+              if (
+                  x["status"] == "TRADING"
+                  and x["quoteAsset"] == "USDT"
+                  and x.get("isSpotTradingAllowed", True)
               )
           }
 
-          tr = s.get(
-              f"{BINANCE}/api/v3/ticker/24hr",
-              timeout=25
-          )
-
+          tr = s.get(f"{BINANCE}/api/v3/ticker/24hr", timeout=25)
           tr.raise_for_status()
-
           volumes = {
-              x["symbol"]:
-              float(
-                  x.get(
-                      "quoteVolume",
-                      0
-                  )
-                  or 0
-              )
+              x["symbol"]: float(x.get("quoteVolume", 0) or 0)
               for x in tr.json()
           }
 
-          # Atualiza primeiro
-          # os paper trades anteriores.
           closed_now = update_paper()
 
           candidates = []
-
           for coin in coins:
-
-              pair = (
-                  coin["symbol"].upper()
-                  + "USDT"
-              )
-
+              pair = coin["symbol"].upper() + "USDT"
               if pair not in valid:
                   continue
-
-              vol = volumes.get(
-                  pair,
-                  0
-              )
-
+              vol = volumes.get(pair, 0)
               if vol < MIN_VOLUME:
                   continue
-
               candidates.append({
-                  "symbol": pair,
-                  "rank":
-                      coin.get(
-                          "market_cap_rank",
-                          999
-                      ),
-                  "volume": vol
+                  "symbol":pair,
+                  "rank":coin.get("market_cap_rank", 999),
+                  "volume":vol
               })
 
-          print(
-              f"{len(candidates)} "
-              "pares Top-200 elegíveis."
-          )
+          print(f"{len(candidates)} pares Top-200 eleg铆veis.")
 
           results = []
-
-          with ThreadPoolExecutor(
-              max_workers=8
-          ) as pool:
-
+          with ThreadPoolExecutor(max_workers=8) as pool:
               futs = [
-                  pool.submit(
-                      analyze,
-                      x["symbol"],
-                      x["volume"],
-                      x["rank"]
-                  )
+                  pool.submit(analyze, x["symbol"], x["volume"], x["rank"])
                   for x in candidates
               ]
-
               for f in as_completed(futs):
-
                   r = f.result()
-
                   if r:
                       results.append(r)
 
           results.sort(
               key=lambda x: (
-                  x.get("status")
-                  == "ENTRAR",
-                  x.get(
-                      "score",
-                      0
-                  )
+                  x.get("status") == "ENTRAR",
+                  x.get("score", 0)
               ),
               reverse=True
           )
 
-          enter_signals = [
-              x
-              for x in results
-              if x.get("status")
-              == "ENTRAR"
-          ]
-
-          print(
-              "Sinais ENTRAR:",
-              len(enter_signals)
-          )
+          enter_signals = [x for x in results if x.get("status") == "ENTRAR"]
+          print("Sinais ENTRAR:", len(enter_signals))
 
           now = int(time.time())
-
           alerts_sent = 0
           duplicates = 0
+          stop_blocks = 0
 
           for r in enter_signals:
-
               symbol = r["symbol"]
-
-              last = int(
-                  STATE["alerts"].get(
-                      symbol,
-                      0
-                  )
-                  or 0
-              )
-
+              last = int(STATE["alerts"].get(symbol, 0) or 0)
               open_trade = any(
-                  t.get("symbol")
-                  == symbol
-                  and t.get("status")
-                  == "OPEN"
+                  t.get("symbol") == symbol and t.get("status") == "OPEN"
                   for t in STATE["trades"]
               )
 
-              if (
-                  open_trade
-                  or now - last < COOLDOWN
-              ):
-
-                  duplicates += 1
-
-                  print(
-                      "ALERT SUPPRESSED:",
-                      symbol
-                  )
-
+              blocked_after_stop, reason = stop_block(symbol, now)
+              if blocked_after_stop:
+                  stop_blocks += 1
+                  print("STOP BLOCK:", symbol, reason)
                   continue
 
+              if open_trade or now - last < ALERT_COOLDOWN:
+                  duplicates += 1
+                  print("ALERT SUPPRESSED:", symbol)
+                  continue
+
+              age = int(r.get("signal_age_candles", 0))
+              confirmation_text = (
+                  "vela 15m mais recente"
+                  if age == 0
+                  else f"h谩 {age} vela(s) 15m (~{age*15} min), ainda v谩lida"
+              )
+
               msg = (
-                  f"🟢 ENTRAR — {symbol}\n\n"
+                  f"馃煝 ENTRAR 鈥� {symbol}\n\n"
                   f"Market Cap Rank: #{r['rank']}\n"
-                  f"Score técnico: {r['score']}/100\n"
-                  f"Preço: {r['price']:.8g}\n\n"
-                  f"Entrada: "
-                  f"{r['entry_low']:.8g} – "
-                  f"{r['entry_high']:.8g}\n"
-                  f"Stop técnico: "
-                  f"{r['stop']:.8g}\n"
+                  f"Score t茅cnico: {r['score']}/100\n"
+                  f"Pre莽o: {r['price']:.8g}\n\n"
+                  f"Entrada: {r['entry_low']:.8g} 鈥� {r['entry_high']:.8g}\n"
+                  f"Stop t茅cnico: {r['stop']:.8g}\n"
                   f"TP1: {r['tp1']:.8g}\n"
                   f"TP2: {r['tp2']:.8g}\n"
                   f"TP3: {r['tp3']:.8g}\n\n"
-                  f"RSI 15m: {r['rsi']:.1f}\n"
-                  f"Volume 15m: "
-                  f"{r['volume_ratio']:.2f}x média\n"
-                  f"OB comprador: "
-                  f"{r['ob_low']:.8g} – "
-                  f"{r['ob_high']:.8g}\n\n"
-                  "✅ Tendência 1H\n"
-                  "✅ Order Block comprador\n"
-                  "✅ Reteste 15m\n"
-                  "✅ Reclaim\n"
-                  "✅ Confirmação de volume\n\n"
-                  "⚠️ Sinal técnico; "
-                  "não garante lucro."
+                  f"RSI confirma莽茫o: {r['rsi']:.1f}\n"
+                  f"Volume confirma莽茫o: {r['volume_ratio']:.2f}x m茅dia\n"
+                  f"OB comprador: {r['ob_low']:.8g} 鈥� {r['ob_high']:.8g}\n"
+                  f"Confirma莽茫o: {confirmation_text}\n\n"
+                  "鉁� Tend锚ncia 1H\n"
+                  "鉁� Order Block comprador\n"
+                  "鉁� Reteste + reclaim 15m\n"
+                  "鉁� Confirma莽茫o de volume\n"
+                  "鉁� Sem extens茫o excessiva\n\n"
+                  "鈿狅笍 Sinal t茅cnico; n茫o garante lucro."
               )
 
               if telegram(msg):
-
-                  STATE["alerts"][
-                      symbol
-                  ] = now
-
+                  STATE["alerts"][symbol] = now
                   STATE["trades"].append({
-                      "symbol":
-                          symbol,
-                      "opened_at":
-                          now,
-                      "last_checked":
-                          now,
-                      "status":
-                          "OPEN",
-                      "entry":
-                          float(
-                              r["price"]
-                          ),
-                      "stop":
-                          float(
-                              r["stop"]
-                          ),
-                      "tp1":
-                          float(
-                              r["tp1"]
-                          ),
-                      "tp2":
-                          float(
-                              r["tp2"]
-                          ),
-                      "tp3":
-                          float(
-                              r["tp3"]
-                          ),
-                      "score":
-                          int(
-                              r["score"]
-                          ),
-                      "rank":
-                          int(
-                              r["rank"]
-                          )
+                      "symbol":symbol,
+                      "opened_at":now,
+                      "last_checked":now,
+                      "status":"OPEN",
+                      "entry":float(r["price"]),
+                      "stop":float(r["stop"]),
+                      "tp1":float(r["tp1"]),
+                      "tp2":float(r["tp2"]),
+                      "tp3":float(r["tp3"]),
+                      "score":int(r["score"]),
+                      "rank":int(r["rank"]),
+                      "signal_age_candles":age
                   })
-
                   alerts_sent += 1
 
               time.sleep(1)
 
-          closed = [
-              t
-              for t in STATE["trades"]
-              if t.get("status")
-              == "CLOSED"
-          ]
-
-          opened = [
-              t
-              for t in STATE["trades"]
-              if t.get("status")
-              == "OPEN"
-          ]
+          closed = [t for t in STATE["trades"] if t.get("status") == "CLOSED"]
+          opened = [t for t in STATE["trades"] if t.get("status") == "OPEN"]
 
           if MANUAL:
-
               top = results[:5]
-
               lines = [
-                  "🧪 SCANNER EXECUTADO",
+                  "馃И SCANNER EXECUTADO 鈥� v2.2 FINAL",
                   "",
                   "Top 200 analisado.",
-                  f"Pares elegíveis: "
-                  f"{len(candidates)}",
-                  f"Sinais ENTRAR: "
-                  f"{len(enter_signals)}",
-                  f"Novos alertas: "
-                  f"{alerts_sent}",
-                  f"Duplicados bloqueados: "
-                  f"{duplicates}",
+                  f"Pares eleg铆veis: {len(candidates)}",
+                  f"Sinais ENTRAR: {len(enter_signals)}",
+                  f"Novos alertas: {alerts_sent}",
+                  f"Duplicados bloqueados: {duplicates}",
+                  f"Bloqueados p贸s-stop: {stop_blocks}",
                   "",
                   "Melhores scores:"
               ]
 
               for x in top:
-
+                  age = x.get("signal_age_candles", 999)
+                  age_txt = "agora" if age == 0 else (f"{age}x15m" if age != 999 else "-")
                   lines.append(
-                      f"{x['symbol']} — "
-                      f"{x.get('score', 0)}/100 "
-                      f"({x.get('status', '')})"
+                      f"{x['symbol']} 鈥� {x.get('score',0)}/100 "
+                      f"({x.get('status','')}) [{age_txt}]"
                   )
 
               lines += [
                   "",
-                  "📊 PAPER TRADING",
-                  f"Abertos: "
-                  f"{len(opened)}",
-                  f"Fechados: "
-                  f"{len(closed)}"
+                  "馃搳 PAPER TRADING",
+                  f"Abertos: {len(opened)}",
+                  f"Fechados: {len(closed)}"
               ]
 
               if closed:
+                  wins = sum(1 for t in closed if t.get("outcome") == "TP1")
+                  win_rate = 100 * wins / len(closed)
 
-                  wins = sum(
-                      1
-                      for t in closed
-                      if t.get("outcome")
-                      == "TP1"
-                  )
-
-                  win_rate = (
-                      100 * wins /
-                      len(closed)
-                  )
-
-                  gp = sum(
-                      max(
-                          float(
-                              t.get(
-                                  "pnl_r",
-                                  0
-                              )
-                          ),
-                          0
-                      )
-                      for t in closed
-                  )
-
-                  gl = abs(
-                      sum(
-                          min(
-                              float(
-                                  t.get(
-                                      "pnl_r",
-                                      0
-                                  )
-                              ),
-                              0
-                          )
-                          for t in closed
-                      )
-                  )
-
-                  pf = (
-                      gp / gl
-                      if gl > 0
-                      else float("inf")
-                  )
+                  gp = sum(max(float(t.get("pnl_r",0)), 0) for t in closed)
+                  gl = abs(sum(min(float(t.get("pnl_r",0)), 0) for t in closed))
+                  pf = gp / gl if gl > 0 else float("inf")
 
                   lines += [
-                      f"Win rate TP1/stop: "
-                      f"{win_rate:.1f}%",
+                      f"Win rate TP1/stop: {win_rate:.1f}%",
                       (
-                          f"Profit factor: "
-                          f"{pf:.2f}"
+                          f"Profit factor: {pf:.2f}"
                           if np.isfinite(pf)
-                          else
-                          "Profit factor: ∞"
+                          else "Profit factor: 鈭�"
                       )
                   ]
 
-              telegram(
-                  "\n".join(lines)
-              )
+              telegram("\n".join(lines))
 
           save_state()
 
-          print(
-              "STATE:",
-              len(STATE["trades"]),
-              "paper trades"
-          )
-
-          print(
-              "Paper fechados "
-              "nesta execução:",
-              len(closed_now)
-          )
-
-          print(
-              "SCAN TERMINADO"
-          )
+          print("STATE:", len(STATE["trades"]), "paper trades")
+          print("Paper fechados nesta execu莽茫o:", len(closed_now))
+          print("Bloqueios p贸s-stop:", stop_blocks)
+          print("SCAN TERMINADO")
 
           PY
