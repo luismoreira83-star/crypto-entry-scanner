@@ -71,8 +71,13 @@ jobs:
           RECOVERY_CANDLES_15M = 4
           MAX_LATE_EXTENSION_ATR = 0.60
 
+          # Filtro macro BTC: so bloqueia novas entradas
+          # quando ha deterioracao clara em 1H + 15m.
+          BTC_RISK_OFF_SCORE = 5
+          BTC_CAUTION_SCORE = 3
+
           s = requests.Session()
-          s.headers.update({"User-Agent": "crypto-entry-scanner/2.2"})
+          s.headers.update({"User-Agent": "crypto-entry-scanner/2.3"})
 
           def load_state():
               try:
@@ -158,6 +163,108 @@ jobs:
                   df["volume"] / df["vol_ma20"].replace(0, np.nan)
               ).fillna(1)
               return df
+
+          def btc_market_regime():
+              try:
+                  h1 = klines("BTCUSDT", "1h")
+                  m15 = klines("BTCUSDT", "15m")
+
+                  if len(h1) < 60 or len(m15) < 60:
+                      return {
+                          "status": "UNKNOWN",
+                          "risk_off": False,
+                          "caution": False,
+                          "score": 0,
+                          "flags": {}
+                      }
+
+                  H = h1.iloc[-1]
+                  M = m15.iloc[-1]
+
+                  red_15m = M["close"] < M["open"]
+                  body_15m = abs(
+                      float(M["close"]) -
+                      float(M["open"])
+                  )
+
+                  flags = {
+                      "h1_below_ema20":
+                          H["close"] < H["ema20"],
+                      "h1_ema20_falling":
+                          h1["ema20"].iloc[-1] <
+                          h1["ema20"].iloc[-4],
+                      "m15_below_ema20":
+                          M["close"] < M["ema20"],
+                      "m15_structure_down":
+                          M["close"] <
+                          m15["close"].iloc[-4],
+                      "m15_sell_volume":
+                          red_15m and
+                          M["vol_ratio"] >= 1.25,
+                      "m15_bear_impulse":
+                          red_15m and
+                          body_15m >=
+                          0.60 * float(M["atr"])
+                  }
+
+                  score = sum(
+                      1 for value in flags.values()
+                      if value
+                  )
+
+                  severe_15m = all([
+                      flags["m15_below_ema20"],
+                      flags["m15_structure_down"],
+                      flags["m15_sell_volume"],
+                      flags["m15_bear_impulse"]
+                  ])
+
+                  risk_off = (
+                      score >= BTC_RISK_OFF_SCORE
+                      or severe_15m
+                  )
+
+                  caution = (
+                      not risk_off
+                      and score >= BTC_CAUTION_SCORE
+                  )
+
+                  status = (
+                      "RISK-OFF"
+                      if risk_off
+                      else (
+                          "CAUTELA"
+                          if caution
+                          else "NORMAL"
+                      )
+                  )
+
+                  return {
+                      "status": status,
+                      "risk_off": risk_off,
+                      "caution": caution,
+                      "score": score,
+                      "flags": flags,
+                      "price": float(M["close"]),
+                      "rsi15": float(M["rsi"]),
+                      "vol15": float(M["vol_ratio"])
+                  }
+
+              except Exception as e:
+                  print(
+                      "BTC regime error:",
+                      e
+                  )
+
+                  # Em falha de dados BTC nao bloqueia:
+                  # evita perder sinais apenas por erro API.
+                  return {
+                      "status": "UNKNOWN",
+                      "risk_off": False,
+                      "caution": False,
+                      "score": 0,
+                      "flags": {}
+                  }
 
           def update_paper():
               closed_now = []
@@ -402,6 +509,14 @@ jobs:
 
           closed_now = update_paper()
 
+          btc_regime = btc_market_regime()
+
+          print(
+              "BTC REGIME:",
+              btc_regime["status"],
+              f"{btc_regime['score']}/6"
+          )
+
           candidates = []
           for coin in coins:
               pair = coin["symbol"].upper() + "USDT"
@@ -437,8 +552,37 @@ jobs:
               reverse=True
           )
 
-          enter_signals = [x for x in results if x.get("status") == "ENTRAR"]
-          print("Sinais ENTRAR:", len(enter_signals))
+          btc_blocked = 0
+          btc_blocked_symbols = []
+
+          if btc_regime["risk_off"]:
+              for x in results:
+                  if x.get("status") == "ENTRAR":
+                      x["status"] = "AGUARDAR"
+                      x["market_blocked"] = True
+                      btc_blocked += 1
+                      btc_blocked_symbols.append(
+                          x["symbol"]
+                      )
+
+              if btc_blocked:
+                  print(
+                      "BTC RISK-OFF BLOCK:",
+                      btc_blocked,
+                      ",".join(
+                          btc_blocked_symbols
+                      )
+                  )
+
+          enter_signals = [
+              x for x in results
+              if x.get("status") == "ENTRAR"
+          ]
+
+          print(
+              "Sinais ENTRAR:",
+              len(enter_signals)
+          )
 
           now = int(time.time())
           alerts_sent = 0
@@ -471,6 +615,16 @@ jobs:
                   else f"h\u00e1 {age} vela(s) 15m (~{age*15} min), ainda v\u00e1lida"
               )
 
+              btc_context = (
+                  f"{RED} RISK-OFF"
+                  if btc_regime["risk_off"]
+                  else (
+                      f"{YELLOW} CAUTELA"
+                      if btc_regime["caution"]
+                      else f"{GREEN} NORMAL"
+                  )
+              )
+
               msg = (
                   f"{GREEN} ENTRAR - {symbol}\n\n"
                   f"Market Cap Rank: #{r['rank']}\n"
@@ -484,7 +638,9 @@ jobs:
                   f"RSI confirma\u00e7\u00e3o: {r['rsi']:.1f}\n"
                   f"Volume confirma\u00e7\u00e3o: {r['volume_ratio']:.2f}x media\n"
                   f"OB comprador: {r['ob_low']:.8g} - {r['ob_high']:.8g}\n"
-                  f"Confirma\u00e7\u00e3o: {confirmation_text}\n\n"
+                  f"Confirma\u00e7\u00e3o: {confirmation_text}\n"
+                  f"Contexto BTC: {btc_context} "
+                  f"({btc_regime['score']}/6 risco)\n\n"
                   f"{CHECK} Tendencia 1H\n"
                   f"{CHECK} Order Block comprador\n"
                   f"{CHECK} Reteste + reclaim 15m\n"
@@ -519,7 +675,7 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  f"{TEST} SCANNER EXECUTADO - v2.2 FINAL",
+                  f"{TEST} SCANNER EXECUTADO - v2.3 MARKET",
                   "",
                   "Top 200 analisado.",
                   f"Pares eleg\u00edveis: {len(candidates)}",
@@ -527,6 +683,21 @@ jobs:
                   f"Novos alertas: {alerts_sent}",
                   f"Duplicados bloqueados: {duplicates}",
                   f"Bloqueados p\u00f3s-stop: {stop_blocks}",
+                  f"Bloqueados por BTC: {btc_blocked}",
+                  "",
+                  (
+                      f"Contexto BTC: {RED} RISK-OFF "
+                      f"({btc_regime['score']}/6)"
+                      if btc_regime["risk_off"]
+                      else (
+                          f"Contexto BTC: {YELLOW} CAUTELA "
+                          f"({btc_regime['score']}/6)"
+                          if btc_regime["caution"]
+                          else
+                          f"Contexto BTC: {GREEN} NORMAL "
+                          f"({btc_regime['score']}/6)"
+                      )
+                  ),
                   "",
                   "Melhores scores:"
               ]
@@ -598,6 +769,7 @@ jobs:
           print("STATE:", len(STATE["trades"]), "paper trades")
           print("Paper fechados nesta execucao:", len(closed_now))
           print("Bloqueios pos-stop:", stop_blocks)
+          print("Bloqueios BTC:", btc_blocked)
           print("SCAN TERMINADO")
 
           PY
