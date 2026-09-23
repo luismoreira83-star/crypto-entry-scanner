@@ -48,6 +48,15 @@ jobs:
           CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
           MANUAL = os.getenv("MANUAL_RUN", "false").lower() == "true"
 
+          # Simbolos gerados em runtime: o ficheiro continua 100% ASCII.
+          GREEN = chr(0x1F7E2)
+          YELLOW = chr(0x1F7E1)
+          RED = chr(0x1F534)
+          CHECK = chr(0x2705)
+          WARNING = chr(0x26A0) + chr(0xFE0F)
+          TEST = chr(0x1F9EA)
+          CHART = chr(0x1F4CA)
+
           TOP_N = 200
           MIN_VOLUME = 5_000_000
           BINANCE = "https://data-api.binance.vision"
@@ -463,7 +472,7 @@ jobs:
               )
 
               msg = (
-                  f"\U0001F7E2 ENTRAR - {symbol}\n\n"
+                  f"{GREEN} ENTRAR - {symbol}\n\n"
                   f"Market Cap Rank: #{r['rank']}\n"
                   f"Score t\u00e9cnico: {r['score']}/100\n"
                   f"Pre\u00e7o: {r['price']:.8g}\n\n"
@@ -476,12 +485,12 @@ jobs:
                   f"Volume confirma\u00e7\u00e3o: {r['volume_ratio']:.2f}x media\n"
                   f"OB comprador: {r['ob_low']:.8g} - {r['ob_high']:.8g}\n"
                   f"Confirma\u00e7\u00e3o: {confirmation_text}\n\n"
-                  "\u2705 Tendencia 1H\n"
-                  "\u2705 Order Block comprador\n"
-                  "\u2705 Reteste + reclaim 15m\n"
-                  "\u2705 Confirmacao de volume\n"
-                  "\u2705 Sem extensao excessiva\n\n"
-                  "\u26A0\uFE0F Sinal tecnico; nao garante lucro."
+                  f"{CHECK} Tendencia 1H\n"
+                  f"{CHECK} Order Block comprador\n"
+                  f"{CHECK} Reteste + reclaim 15m\n"
+                  f"{CHECK} Confirmacao de volume\n"
+                  f"{CHECK} Sem extensao excessiva\n\n"
+                  f"{WARNING} Sinal tecnico; nao garante lucro."
               )
 
               if telegram(msg):
@@ -510,7 +519,7 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  "\U0001F9EA SCANNER EXECUTADO - v2.2 FINAL",
+                  f"{TEST} SCANNER EXECUTADO - v2.2 FINAL",
                   "",
                   "Top 200 analisado.",
                   f"Pares eleg\u00edveis: {len(candidates)}",
@@ -524,15 +533,43 @@ jobs:
 
               for x in top:
                   age = x.get("signal_age_candles", 999)
-                  age_txt = "agora" if age == 0 else (f"{age}x15m" if age != 999 else "-")
+                  age_txt = (
+                      "agora"
+                      if age == 0
+                      else (
+                          f"{age}x15m"
+                          if age != 999
+                          else "-"
+                      )
+                  )
+
+                  score_x = int(
+                      x.get("score", 0)
+                      or 0
+                  )
+
+                  if x.get("status") == "ENTRAR":
+                      light = GREEN
+                      display_status = "ENTRAR"
+                  elif score_x >= 70:
+                      light = YELLOW
+                      display_status = "AGUARDAR"
+                  else:
+                      light = RED
+                      display_status = "EVITAR"
+
                   lines.append(
-                      f"{x['symbol']} - {x.get('score',0)}/100 "
-                      f"({x.get('status','')}) [{age_txt}]"
+                      f"{light} {x['symbol']} - "
+                      f"{score_x}/100 "
+                      f"({display_status}) "
+                      f"[{age_txt}]"
                   )
 
               lines += [
                   "",
-                  "\U0001F4CA PAPER TRADING",
+                  f"{GREEN} ENTRAR | {YELLOW} AGUARDAR | {RED} EVITAR",
+                  "",
+                  f"{CHART} PAPER TRADING",
                   f"Abertos: {len(opened)}",
                   f"Fechados: {len(closed)}"
               ]
