@@ -76,8 +76,15 @@ jobs:
           BTC_RISK_OFF_SCORE = 5
           BTC_CAUTION_SCORE = 3
 
+          # Retencao de forca para sinais recuperados (15-60 min).
+          # Nao altera sinais frescos da vela 15m mais recente.
+          STRENGTH_MIN_RSI15 = 48
+          STRENGTH_MAX_DROP_ATR = 0.35
+          STRENGTH_BEAR_BODY_ATR = 0.45
+          STRENGTH_BEAR_VOL_RATIO = 1.10
+
           s = requests.Session()
-          s.headers.update({"User-Agent": "crypto-entry-scanner/2.3"})
+          s.headers.update({"User-Agent": "crypto-entry-scanner/2.4"})
 
           def load_state():
               try:
@@ -415,8 +422,57 @@ jobs:
                   not_extended = price <= H["ema20"] + 1.60 * H["atr"]
                   current_above_ob = price > ob_high
                   late_not_chased = bool(
-                      confirm and price <= confirm["close"] + MAX_LATE_EXTENSION_ATR * a15
+                      confirm and
+                      price <= confirm["close"] +
+                      MAX_LATE_EXTENSION_ATR * a15
                   )
+
+                  signal_age = (
+                      int(confirm["age_candles"])
+                      if confirm
+                      else 999
+                  )
+
+                  current_rsi = float(M["rsi"])
+                  current_above_ema20 = (
+                      price >= float(M["ema20"])
+                  )
+
+                  current_not_faded = bool(
+                      confirm and
+                      price >=
+                      confirm["close"] -
+                      STRENGTH_MAX_DROP_ATR * a15
+                  )
+
+                  current_bear_body = abs(
+                      float(M["close"]) -
+                      float(M["open"])
+                  )
+
+                  current_bear_impulse = (
+                      M["close"] < M["open"]
+                      and current_bear_body >=
+                      STRENGTH_BEAR_BODY_ATR * a15
+                      and float(M["vol_ratio"]) >=
+                      STRENGTH_BEAR_VOL_RATIO
+                  )
+
+                  # Apenas sinais recuperados precisam provar
+                  # que ainda mantem forca. Sinais frescos
+                  # continuam com a logica anterior.
+                  if signal_age == 0:
+                      strength_retained = True
+                  elif signal_age in (1, 2, 3):
+                      strength_retained = all([
+                          current_above_ema20,
+                          current_rsi >=
+                          STRENGTH_MIN_RSI15,
+                          current_not_faded,
+                          not current_bear_impulse
+                      ])
+                  else:
+                      strength_retained = False
 
                   score = (
                       20*trend +
@@ -433,6 +489,7 @@ jobs:
                       bool(confirm),
                       current_above_ob,
                       late_not_chased,
+                      strength_retained,
                       not_extended
                   ])
 
@@ -461,9 +518,18 @@ jobs:
                       "volume24":volume24,
                       "ob_low":ob_low,
                       "ob_high":ob_high,
-                      "signal_age_candles":(
-                          int(confirm["age_candles"]) if confirm else 999
-                      )
+                      "signal_age_candles":
+                          signal_age,
+                      "strength_retained":
+                          bool(strength_retained),
+                      "current_rsi":
+                          current_rsi,
+                      "current_above_ema20":
+                          bool(current_above_ema20),
+                      "current_not_faded":
+                          bool(current_not_faded),
+                      "current_bear_impulse":
+                          bool(current_bear_impulse)
                   }
 
               except Exception as e:
@@ -639,12 +705,17 @@ jobs:
                   f"Volume confirma\u00e7\u00e3o: {r['volume_ratio']:.2f}x media\n"
                   f"OB comprador: {r['ob_low']:.8g} - {r['ob_high']:.8g}\n"
                   f"Confirma\u00e7\u00e3o: {confirmation_text}\n"
+                  f"Forca atual 15m: "
+                  f"{CHECK if r.get('strength_retained', True) else WARNING} "
+                  f"RSI {r.get('current_rsi', r['rsi']):.1f} | "
+                  f"EMA20 {'OK' if r.get('current_above_ema20', True) else 'NAO'}\n"
                   f"Contexto BTC: {btc_context} "
                   f"({btc_regime['score']}/6 risco)\n\n"
                   f"{CHECK} Tendencia 1H\n"
                   f"{CHECK} Order Block comprador\n"
                   f"{CHECK} Reteste + reclaim 15m\n"
                   f"{CHECK} Confirmacao de volume\n"
+                  f"{CHECK} Retencao de forca 15m\n"
                   f"{CHECK} Sem extensao excessiva\n\n"
                   f"{WARNING} Sinal tecnico; nao garante lucro."
               )
@@ -675,7 +746,7 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  f"{TEST} SCANNER EXECUTADO - v2.3 MARKET",
+                  f"{TEST} SCANNER EXECUTADO - v2.4 STRENGTH",
                   "",
                   "Top 200 analisado.",
                   f"Pares eleg\u00edveis: {len(candidates)}",
@@ -729,11 +800,25 @@ jobs:
                       light = RED
                       display_status = "EVITAR"
 
+                  reason_tag = ""
+
+                  if (
+                      x.get("status") != "ENTRAR"
+                      and x.get("signal_age_candles", 999)
+                      in (1, 2, 3)
+                      and not x.get(
+                          "strength_retained",
+                          True
+                      )
+                  ):
+                      reason_tag = " [FORCA]"
+
                   lines.append(
                       f"{light} {x['symbol']} - "
                       f"{score_x}/100 "
                       f"({display_status}) "
                       f"[{age_txt}]"
+                      f"{reason_tag}"
                   )
 
               lines += [
