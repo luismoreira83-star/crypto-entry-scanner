@@ -2,9 +2,11 @@ name: Crypto Entry Scanner
 
 on:
   workflow_dispatch:
-  schedule:
-    # 7 min depois do fecho de cada vela 15m.
-    - cron: "7,22,37,52 * * * *"
+    inputs:
+      scheduled:
+        description: "External 15m scheduler"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -36,7 +38,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled != 'true' }}
         run: |
           python - <<'PY'
           import os, time, json, requests
