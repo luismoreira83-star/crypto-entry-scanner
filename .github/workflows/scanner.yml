@@ -78,13 +78,19 @@ jobs:
 
           # Retencao de forca para sinais recuperados (15-60 min).
           # Nao altera sinais frescos da vela 15m mais recente.
-          STRENGTH_MIN_RSI15 = 48
-          STRENGTH_MAX_DROP_ATR = 0.35
-          STRENGTH_BEAR_BODY_ATR = 0.45
-          STRENGTH_BEAR_VOL_RATIO = 1.10
+          STRENGTH_MIN_RSI15 = 50
+          STRENGTH_MAX_DROP_ATR = 0.20
+          STRENGTH_BEAR_BODY_ATR = 0.40
+          STRENGTH_BEAR_VOL_RATIO = 1.05
+          STRENGTH_MIN_CURRENT_VOLUME = 0.80
+          STRENGTH_MIN_FOLLOW_ATR = 0.10
+          STRENGTH_MAX_3BAR_DROP_ATR = 0.10
+          BREAKOUT_LOOKBACK_15M = 12
+          BREAKOUT_NEAR_ATR = 0.12
+          BREAKOUT_MIN_VOLUME = 1.10
 
           s = requests.Session()
-          s.headers.update({"User-Agent": "crypto-entry-scanner/2.4"})
+          s.headers.update({"User-Agent": "crypto-entry-scanner/2.5"})
 
           def load_state():
               try:
@@ -389,6 +395,7 @@ jobs:
                       return {
                           "age_candles": last_idx - idx,
                           "close": float(C["close"]),
+                          "high": float(C["high"]),
                           "rsi": float(C["rsi"]),
                           "volume_ratio": float(C["vol_ratio"])
                       }
@@ -434,6 +441,9 @@ jobs:
                   )
 
                   current_rsi = float(M["rsi"])
+                  current_volume_ratio = float(
+                      M["vol_ratio"]
+                  )
                   current_above_ema20 = (
                       price >= float(M["ema20"])
                   )
@@ -454,13 +464,69 @@ jobs:
                       M["close"] < M["open"]
                       and current_bear_body >=
                       STRENGTH_BEAR_BODY_ATR * a15
-                      and float(M["vol_ratio"]) >=
+                      and current_volume_ratio >=
                       STRENGTH_BEAR_VOL_RATIO
                   )
 
-                  # Apenas sinais recuperados precisam provar
-                  # que ainda mantem forca. Sinais frescos
-                  # continuam com a logica anterior.
+                  current_volume_ok = (
+                      current_volume_ratio >=
+                      STRENGTH_MIN_CURRENT_VOLUME
+                  )
+
+                  recent_3bar_ok = (
+                      price >=
+                      float(m15["close"].iloc[-3]) -
+                      STRENGTH_MAX_3BAR_DROP_ATR * a15
+                  )
+
+                  follow_through = False
+                  breakout_volume_ok = True
+
+                  if confirm and signal_age in (1, 2, 3):
+                      confirm_idx = (
+                          len(m15) - 1 - signal_age
+                      )
+                      after_confirm = m15.iloc[
+                          confirm_idx + 1:
+                      ]
+
+                      if len(after_confirm):
+                          follow_through = (
+                              float(
+                                  after_confirm["high"].max()
+                              ) >=
+                              confirm["high"] +
+                              STRENGTH_MIN_FOLLOW_ATR *
+                              a15
+                          )
+
+                      lookback_start = max(
+                          0,
+                          len(m15) -
+                          BREAKOUT_LOOKBACK_15M - 1
+                      )
+                      prev_high = float(
+                          m15["high"].iloc[
+                              lookback_start:-1
+                          ].max()
+                      )
+
+                      near_breakout = (
+                          price >=
+                          prev_high -
+                          BREAKOUT_NEAR_ATR * a15
+                      )
+
+                      breakout_volume_ok = (
+                          not near_breakout
+                          or current_volume_ratio >=
+                          BREAKOUT_MIN_VOLUME
+                      )
+
+                  # Sinais frescos continuam com a logica
+                  # anterior. Sinais recuperados precisam
+                  # demonstrar follow-through e momentum
+                  # ainda presentes.
                   if signal_age == 0:
                       strength_retained = True
                   elif signal_age in (1, 2, 3):
@@ -469,6 +535,10 @@ jobs:
                           current_rsi >=
                           STRENGTH_MIN_RSI15,
                           current_not_faded,
+                          current_volume_ok,
+                          recent_3bar_ok,
+                          follow_through,
+                          breakout_volume_ok,
                           not current_bear_impulse
                       ])
                   else:
@@ -524,10 +594,20 @@ jobs:
                           bool(strength_retained),
                       "current_rsi":
                           current_rsi,
+                      "current_volume_ratio":
+                          current_volume_ratio,
                       "current_above_ema20":
                           bool(current_above_ema20),
                       "current_not_faded":
                           bool(current_not_faded),
+                      "current_volume_ok":
+                          bool(current_volume_ok),
+                      "recent_3bar_ok":
+                          bool(recent_3bar_ok),
+                      "follow_through":
+                          bool(follow_through),
+                      "breakout_volume_ok":
+                          bool(breakout_volume_ok),
                       "current_bear_impulse":
                           bool(current_bear_impulse)
                   }
@@ -708,7 +788,8 @@ jobs:
                   f"Forca atual 15m: "
                   f"{CHECK if r.get('strength_retained', True) else WARNING} "
                   f"RSI {r.get('current_rsi', r['rsi']):.1f} | "
-                  f"EMA20 {'OK' if r.get('current_above_ema20', True) else 'NAO'}\n"
+                  f"EMA20 {'OK' if r.get('current_above_ema20', True) else 'NAO'} | "
+                  f"Vol {r.get('current_volume_ratio', 1.0):.2f}x\n"
                   f"Contexto BTC: {btc_context} "
                   f"({btc_regime['score']}/6 risco)\n\n"
                   f"{CHECK} Tendencia 1H\n"
@@ -716,6 +797,7 @@ jobs:
                   f"{CHECK} Reteste + reclaim 15m\n"
                   f"{CHECK} Confirmacao de volume\n"
                   f"{CHECK} Retencao de forca 15m\n"
+                  f"{CHECK} Follow-through confirmado\n"
                   f"{CHECK} Sem extensao excessiva\n\n"
                   f"{WARNING} Sinal tecnico; nao garante lucro."
               )
@@ -746,7 +828,7 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  f"{TEST} SCANNER EXECUTADO - v2.4 STRENGTH",
+                  f"{TEST} SCANNER EXECUTADO - v2.5 MOMENTUM",
                   "",
                   "Top 200 analisado.",
                   f"Pares eleg\u00edveis: {len(candidates)}",
@@ -811,7 +893,7 @@ jobs:
                           True
                       )
                   ):
-                      reason_tag = " [FORCA]"
+                      reason_tag = " [MOMENTUM]"
 
                   lines.append(
                       f"{light} {x['symbol']} - "
