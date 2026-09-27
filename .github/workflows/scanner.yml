@@ -774,12 +774,13 @@ jobs:
               )
 
               msg = (
-                  f"{GREEN} ENTRAR - {symbol}\n\n"
+                  f"{GREEN} ALERTA OPERACIONAL - ENTRAR\n"
+                  f"{symbol}\n\n"
                   f"Market Cap Rank: #{r['rank']}\n"
                   f"Score t\u00e9cnico: {r['score']}/100\n"
-                  f"Pre\u00e7o: {r['price']:.8g}\n\n"
-                  f"Entrada: {r['entry_low']:.8g} - {r['entry_high']:.8g}\n"
-                  f"Stop t\u00e9cnico: {r['stop']:.8g}\n"
+                  f"Pre\u00e7o analisado: {r['price']:.8g}\n\n"
+                  f"Zona de entrada: {r['entry_low']:.8g} - {r['entry_high']:.8g}\n"
+                  f"Stop: {r['stop']:.8g}\n"
                   f"TP1: {r['tp1']:.8g}\n"
                   f"TP2: {r['tp2']:.8g}\n"
                   f"TP3: {r['tp3']:.8g}\n\n"
@@ -801,6 +802,8 @@ jobs:
                   f"{CHECK} Retencao de forca 15m\n"
                   f"{CHECK} Follow-through confirmado\n"
                   f"{CHECK} Sem extensao excessiva\n\n"
+                  f"{WARNING} Confirmar o pre\u00e7o atual antes de executar.\n"
+                  f"{WARNING} Nao entrar acima da zona indicada; respeitar o stop.\n"
                   f"{WARNING} Sinal tecnico; nao garante lucro."
               )
 
@@ -830,7 +833,7 @@ jobs:
           if MANUAL:
               top = results[:5]
               lines = [
-                  f"{TEST} SCANNER EXECUTADO - v2.5 MOMENTUM",
+                  f"{TEST} SCANNER EXECUTADO - v2.5 MOMENTUM / OPERACIONAL",
                   "",
                   "Top 200 analisado.",
                   f"Pares eleg\u00edveis: {len(candidates)}",
